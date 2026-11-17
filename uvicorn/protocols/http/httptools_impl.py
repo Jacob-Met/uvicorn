@@ -167,6 +167,10 @@ class HttpToolsProtocol(asyncio.Protocol):
         return upgrade == b"websocket" and self._should_upgrade_to_ws()
 
     def data_received(self, data: bytes) -> None:
+        # A graceful transport close can still be followed by queued data.
+        if self.transport.is_closing():
+            return
+
         self._unset_keepalive_if_required()
 
         try:
@@ -203,6 +207,17 @@ class HttpToolsProtocol(asyncio.Protocol):
         protocol.data_received(b"".join(output))
 
     def send_400_response(self, msg: str) -> None:
+        # Do not start a second response while the original request or
+        # response is still active. A completed response may precede its
+        # request body's completion (e.g. an early POST response).
+        if (
+            self.cycle is not None
+            and self.cycle.response_started
+            and (not self.cycle.response_complete or self.cycle.more_body)
+        ):
+            self.transport.close()
+            return
+
         content = [STATUS_LINE[400]]
         for name, value in self.server_state.default_headers:
             content.extend([name, b": ", value, b"\r\n"])  # pragma: full coverage
