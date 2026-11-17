@@ -356,7 +356,8 @@ class RequestResponseCycle:
         self.response_complete = False
         self.bodyless = False
         self.chunked_encoding = False
-        self.expected_content_length = 0
+        self.close_delimited = False
+        self.expected_content_length: int | None = 0
 
     # ASGI exception wrapper
     async def run_asgi(self, app: ASGI3Application) -> None:
@@ -424,11 +425,12 @@ class RequestResponseCycle:
             headers = self.default_headers + list(message.get("headers", []))
 
             bodyless = self.scope["method"] == "HEAD" or status in (204, 304) or status < 200
+            http10 = self.scope["http_version"] == "1.0"
 
             # RFC 9112 §6.1 forbids Transfer-Encoding on 1xx and 204 responses, and
             # zttp refuses to serialize one there, so drop it instead of erroring.
             # HEAD and 304 may keep it: it describes the body a GET would return.
-            if status < 200 or status == 204:
+            if status < 200 or status == 204 or http10:
                 headers = [(name, value) for name, value in headers if name.lower() != b"transfer-encoding"]
 
             has_content_length = False
@@ -456,8 +458,17 @@ class RequestResponseCycle:
             # Content-Length or Transfer-Encoding, so add chunked encoding
             # ourselves when the application provides neither.
             if not bodyless and not has_transfer_encoding and not has_content_length:
-                self.chunked_encoding = True
-                headers = headers + [(b"transfer-encoding", b"chunked")]
+                if http10:
+                    # zttp cannot encode close-delimited bodies: write raw
+                    # bytes after the validated response headers, then close.
+                    self.close_delimited = True
+                    self.keep_alive = False
+                    self.expected_content_length = None
+                    headers = [(name, value) for name, value in headers if name.lower() != b"connection"]
+                    headers.append((b"connection", b"close"))
+                else:
+                    self.chunked_encoding = True
+                    headers = headers + [(b"transfer-encoding", b"chunked")]
 
             if self.access_log:
                 self.access_logger.info(
@@ -485,26 +496,31 @@ class RequestResponseCycle:
             # Write response body
             if self.bodyless:
                 self.expected_content_length = 0
+            elif self.close_delimited:
+                if body:
+                    self.transport.write(body)
             elif self.chunked_encoding:
                 if body:
                     self.conn.send_data(body)
                     self.transport.write(self.conn.data_to_send())
             else:
-                if len(body) > self.expected_content_length:
-                    raise RuntimeError("Response content longer than Content-Length")
-                self.expected_content_length -= len(body)
+                if self.expected_content_length is not None:
+                    if len(body) > self.expected_content_length:
+                        raise RuntimeError("Response content longer than Content-Length")
+                    self.expected_content_length -= len(body)
                 if body:
                     self.conn.send_data(body)
                     self.transport.write(self.conn.data_to_send())
 
             # Handle response completion
             if not more_body:
-                if self.expected_content_length != 0:
+                if self.expected_content_length is not None and self.expected_content_length != 0:
                     raise RuntimeError("Response content shorter than Content-Length")
                 self.response_complete = True
                 self.message_event.set()
-                self.conn.end_message()
-                self.transport.write(self.conn.data_to_send())
+                if not self.close_delimited:
+                    self.conn.end_message()
+                    self.transport.write(self.conn.data_to_send())
 
         else:
             # Response already sent
@@ -513,7 +529,7 @@ class RequestResponseCycle:
         if self.response_complete:
             # `should_close()` covers both directions: the request's `Connection: close`
             # or HTTP/1.0 default, and a `close` the response we just wrote declared.
-            if not self.keep_alive or self.conn.should_close():
+            if self.close_delimited or not self.keep_alive or self.conn.should_close():
                 self.transport.close()
             self.on_response()
 
