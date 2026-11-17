@@ -412,7 +412,7 @@ class RequestResponseCycle:
         self.response_started = False
         self.response_complete = False
         self.chunked_encoding: bool | None = None
-        self.expected_content_length = 0
+        self.expected_content_length: int | None = 0
 
     # ASGI exception wrapper
     async def run_asgi(self, app: ASGI3Application) -> None:
@@ -475,6 +475,19 @@ class RequestResponseCycle:
 
             status_code = message["status"]
             headers = self.default_headers + list(message.get("headers", []))
+            http10 = self.scope["http_version"] == "1.0"
+            if http10:
+                # HTTP/1.0 has no Transfer-Encoding. Unknown-length bodies must
+                # be close-delimited, even when a client asked for keep-alive.
+                headers = [(name, value) for name, value in headers if name.lower() != b"transfer-encoding"]
+                if (
+                    self.scope["method"] != "HEAD"
+                    and status_code not in (204, 304)
+                    and not any(name.lower() == b"content-length" for name, _ in headers)
+                ):
+                    self.keep_alive = False
+                    headers = [(name, value) for name, value in headers if name.lower() != b"connection"]
+                    headers.append((b"connection", b"close"))
 
             if self.access_log:
                 self.access_logger.info(
@@ -514,9 +527,12 @@ class RequestResponseCycle:
                 content.append(b"connection: close\r\n")
 
             if self.chunked_encoding is None and self.scope["method"] != "HEAD" and status_code not in (204, 304):
-                # Neither content-length nor transfer-encoding specified
-                self.chunked_encoding = True
-                content.append(b"transfer-encoding: chunked\r\n")
+                # Neither content-length nor transfer-encoding specified.
+                if http10:
+                    self.expected_content_length = None
+                else:
+                    self.chunked_encoding = True
+                    content.append(b"transfer-encoding: chunked\r\n")
 
             content.append(b"\r\n")
             self.transport.write(b"".join(content))
@@ -542,15 +558,15 @@ class RequestResponseCycle:
                 self.transport.write(b"".join(content))
             else:
                 num_bytes = len(body)
-                if num_bytes > self.expected_content_length:
-                    raise RuntimeError("Response content longer than Content-Length")
-                else:
+                if self.expected_content_length is not None:
+                    if num_bytes > self.expected_content_length:
+                        raise RuntimeError("Response content longer than Content-Length")
                     self.expected_content_length -= num_bytes
                 self.transport.write(body)
 
             # Handle response completion
             if not more_body:
-                if self.expected_content_length != 0:
+                if self.expected_content_length is not None and self.expected_content_length != 0:
                     raise RuntimeError("Response content shorter than Content-Length")
                 self.response_complete = True
                 self.message_event.set()

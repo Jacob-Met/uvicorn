@@ -827,6 +827,49 @@ async def test_http10_request(http_protocol_cls: type[HTTPProtocol]):
     assert b"Version: 1.0" in protocol.transport.buffer
 
 
+@pytest.mark.parametrize("request_keep_alive", [False, True], ids=["default-close", "explicit-keep-alive"])
+@pytest.mark.parametrize(
+    ("response_header", "must_close"),
+    [
+        pytest.param(None, True, id="implicit-unframed"),
+        pytest.param((b"connection", b"keep-alive"), True, id="response-keep-alive-override"),
+        pytest.param((b"transfer-encoding", b"chunked"), True, id="explicit-chunked"),
+        pytest.param((b"content-length", b"11"), False, id="declared-length"),
+    ],
+)
+async def test_http10_streaming_response_close_delimited(
+    http_protocol_cls: type[HTTPProtocol],
+    request_keep_alive: bool,
+    response_header: tuple[bytes, bytes] | None,
+    must_close: bool,
+) -> None:
+    async def app(scope: Scope, receive: ASGIReceiveCallable, send: ASGISendCallable) -> None:
+        headers = [(b"content-type", b"text/plain")]
+        if response_header is not None:
+            headers.append(response_header)
+        await send({"type": "http.response.start", "status": 200, "headers": headers})
+        await send({"type": "http.response.body", "body": b"Hello", "more_body": True})
+        await send({"type": "http.response.body", "body": b" world", "more_body": False})
+
+    request = b"GET / HTTP/1.0\r\nHost: example.org\r\n"
+    if request_keep_alive:
+        request += b"Connection: keep-alive\r\n"
+    request += b"\r\n"
+
+    protocol = get_connected_protocol(app, http_protocol_cls)
+    protocol.data_received(request)
+    await protocol.loop.run_one()
+
+    headers, body = protocol.transport.buffer.split(b"\r\n\r\n", 1)
+    assert b"transfer-encoding:" not in headers.lower()
+    assert body == b"Hello world"
+    if must_close:
+        assert protocol.transport.is_closing()
+        assert headers.lower().count(b"connection: close") == 1
+    else:
+        assert b"content-length: 11" in headers.lower()
+
+
 async def test_root_path(http_protocol_cls: type[HTTPProtocol]):
     async def app(scope: Scope, receive: ASGIReceiveCallable, send: ASGISendCallable):
         assert scope["type"] == "http"
