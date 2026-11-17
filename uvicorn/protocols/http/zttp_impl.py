@@ -135,6 +135,10 @@ class ZttpProtocol(asyncio.Protocol):
         return False
 
     def data_received(self, data: bytes) -> None:
+        # A graceful transport close can still be followed by queued data.
+        if self.transport.is_closing():
+            return
+
         self._unset_keepalive_if_required()
         try:
             self.handle_events(self.conn.receive_event(data))
@@ -250,6 +254,17 @@ class ZttpProtocol(asyncio.Protocol):
         protocol.data_received(bytes(output))
 
     def send_400_response(self, msg: str) -> None:
+        # Do not start a second response while the original request or
+        # response is still active. A completed response may precede its
+        # request body's completion (e.g. an early POST response).
+        if (
+            self.cycle is not None
+            and self.cycle.response_started
+            and (not self.cycle.response_complete or self.cycle.more_body)
+        ):
+            self.transport.close()
+            return
+
         body = msg.encode("ascii")
         headers: list[tuple[bytes, bytes]] = [
             (b"content-type", b"text/plain; charset=utf-8"),
