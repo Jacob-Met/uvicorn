@@ -1144,6 +1144,78 @@ def test_fragmentation(unused_tcp_port: int):
     t.join()
 
 
+@pytest.mark.parametrize("first_request", ["completed", "malformed"])
+async def test_late_data_after_closed_transport(http_protocol_cls: type[HTTPProtocol], first_request: str) -> None:
+    protocol = get_connected_protocol(Response("done"), http_protocol_cls, access_log=False)
+    if first_request == "completed":
+        protocol.data_received(CONNECTION_CLOSE_REQUEST)
+        await protocol.loop.run_one()
+    else:
+        protocol.data_received(b"G?T / HTTP/1.1\r\nHost: example.org\r\n\r\n")
+    assert protocol.transport.is_closing()
+    response_before_late_data = protocol.transport.buffer
+
+    protocol.data_received(SIMPLE_GET_REQUEST)
+    protocol.data_received(b"unparseable\r\n\r\n")
+    assert protocol.transport.buffer == response_before_late_data
+
+
+async def test_invalid_chunk_during_stream_closes_without_second_response(
+    http_protocol_cls: type[HTTPProtocol],
+) -> None:
+    started = asyncio.Event()
+    release = asyncio.Event()
+
+    async def app(scope: Scope, receive: ASGIReceiveCallable, send: ASGISendCallable) -> None:
+        await send({"type": "http.response.start", "status": 200, "headers": [(b"content-type", b"text/plain")]})
+        await send({"type": "http.response.body", "body": b"partial", "more_body": True})
+        started.set()
+        await release.wait()
+
+    protocol = get_connected_protocol(app, http_protocol_cls, access_log=False)
+    protocol.data_received(b"POST / HTTP/1.1\r\nHost: example.org\r\nTransfer-Encoding: chunked\r\n\r\n")
+    app_task = asyncio.create_task(protocol.loop.run_one())
+    await started.wait()
+
+    try:
+        protocol.data_received(b"not-a-chunk-size\r\n")
+        assert protocol.transport.is_closing()
+        assert b"HTTP/1.1 200 OK" in protocol.transport.buffer
+        assert b"HTTP/1.1 400" not in protocol.transport.buffer
+    finally:
+        protocol.connection_lost(RuntimeError("remote client disconnected"))
+        release.set()
+        await app_task
+
+
+async def test_invalid_chunk_after_response_complete_closes_without_second_response(
+    http_protocol_cls: type[HTTPProtocol],
+) -> None:
+    protocol = get_connected_protocol(Response("done"), http_protocol_cls, access_log=False)
+    protocol.data_received(b"POST / HTTP/1.1\r\nHost: example.org\r\nTransfer-Encoding: chunked\r\n\r\n")
+    await protocol.loop.run_one()
+    assert b"HTTP/1.1 200 OK" in protocol.transport.buffer
+    assert b"done" in protocol.transport.buffer
+    response_before_invalid_body = protocol.transport.buffer
+
+    protocol.data_received(b"not-a-chunk-size\r\n")
+    assert protocol.transport.is_closing()
+    assert protocol.transport.buffer == response_before_invalid_body
+
+
+async def test_malformed_request_after_keepalive_still_gets_400(
+    http_protocol_cls: type[HTTPProtocol],
+) -> None:
+    protocol = get_connected_protocol(Response("done"), http_protocol_cls, access_log=False)
+    protocol.data_received(SIMPLE_GET_REQUEST)
+    await protocol.loop.run_one()
+    assert not protocol.transport.is_closing()
+
+    protocol.data_received(b"G?T / HTTP/1.1\r\nHost: example.org\r\n\r\n")
+    assert b"HTTP/1.1 400 Bad Request" in protocol.transport.buffer
+    assert protocol.transport.is_closing()
+
+
 async def test_huge_headers_h11protocol_failure():
     app = Response("Hello, world", media_type="text/plain")
 

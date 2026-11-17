@@ -169,6 +169,10 @@ class H11Protocol(asyncio.Protocol):
         return False
 
     def data_received(self, data: bytes) -> None:
+        # A graceful transport close can still be followed by queued data.
+        if self.transport.is_closing():
+            return
+
         self._unset_keepalive_if_required()
 
         self.conn.receive_data(data)
@@ -293,6 +297,12 @@ class H11Protocol(asyncio.Protocol):
         protocol.data_received(b"".join(output))
 
     def send_400_response(self, msg: str) -> None:
+        # Once a response has begun, another response head is illegal.
+        if self.conn.our_state is not h11.IDLE:
+            if not self.transport.is_closing():
+                self.transport.close()
+            return
+
         reason = STATUS_PHRASES[400]
         headers: list[tuple[bytes, bytes]] = [
             (b"content-type", b"text/plain; charset=utf-8"),
